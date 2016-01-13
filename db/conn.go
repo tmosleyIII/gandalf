@@ -1,4 +1,4 @@
-// Copyright 2014 gandalf authors. All rights reserved.
+// Copyright 2015 gandalf authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -56,8 +56,10 @@ func (s *Storage) User() *storage.Collection {
 }
 
 func (s *Storage) Key() *storage.Collection {
-	index := mgo.Index{Key: []string{"body"}, Unique: true}
+	bodyIndex := mgo.Index{Key: []string{"body"}, Unique: true}
+	nameIndex := mgo.Index{Key: []string{"username", "name"}, Unique: true}
 	c := s.Collection("key")
-	c.EnsureIndex(index)
+	c.EnsureIndex(bodyIndex)
+	c.EnsureIndex(nameIndex)
 	return c
 }

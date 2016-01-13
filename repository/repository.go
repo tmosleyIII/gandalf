@@ -75,6 +75,7 @@ type Ref struct {
 	Name      string   `json:"name"`
 	Author    *GitUser `json:"author"`
 	Committer *GitUser `json:"committer"`
+	Tagger    *GitUser `json:"tagger"`
 	Links     *Links   `json:"_links"`
 	Subject   string   `json:"subject"`
 	CreatedAt string   `json:"createdAt"`
@@ -146,7 +147,7 @@ func New(name string, users, readOnlyUsers []string, isPublic bool) (*Repository
 	}
 	barePath := barePath(name)
 	if barePath != "" && isPublic {
-		if f, err := fs.Filesystem().Create(barePath + "/git-daemon-export-ok"); err == nil {
+		if f, createErr := fs.Filesystem().Create(barePath + "/git-daemon-export-ok"); createErr == nil {
 			f.Close()
 		}
 	}
@@ -239,7 +240,8 @@ func (r *Repository) ReadWriteURL() string {
 	}
 	remote := uid + "@%s:%s.git"
 	if useSSH, _ := config.GetBool("git:ssh:use"); useSSH {
-		port, err := config.GetString("git:ssh:port")
+		var port string
+		port, err = config.GetString("git:ssh:port")
 		if err == nil {
 			remote = "ssh://" + uid + "@%s:" + port + "/%s.git"
 		} else {
@@ -377,10 +379,9 @@ type ContentRetriever interface {
 	GetDiff(repo, lastCommit, previousCommit string) ([]byte, error)
 	GetTags(repo string) ([]Ref, error)
 	TempClone(repo string) (string, func(), error)
-	SetCommitter(cloneDir string, committer GitUser) error
 	Checkout(cloneDir, branch string, isNew bool) error
 	AddAll(cloneDir string) error
-	Commit(cloneDir, message string, author GitUser) error
+	Commit(cloneDir, message string, author, committer GitUser) error
 	Push(cloneDir, branch string) error
 	CommitZip(repo string, z *multipart.FileHeader, c GitCommit) (*Ref, error)
 	GetLogs(repo, hash string, total int, path string) (*GitHistory, error)
@@ -485,7 +486,7 @@ func (*GitContentRetriever) GetTree(repo, ref, path string) ([]map[string]string
 }
 
 func (*GitContentRetriever) GetForEachRef(repo, pattern string) ([]Ref, error) {
-	var ref, name, committerName, committerEmail, committerDate, authorName, authorEmail, authorDate, subject string
+	var ref, name, committerName, committerEmail, committerDate, authorName, authorEmail, authorDate, taggerName, taggerEmail, taggerDate, subject string
 	gitPath, err := exec.LookPath("git")
 	if err != nil {
 		return nil, fmt.Errorf("Error when trying to obtain the refs of repository %s (%s).", repo, err)
@@ -495,7 +496,7 @@ func (*GitContentRetriever) GetForEachRef(repo, pattern string) ([]Ref, error) {
 	if err != nil || !repoExists {
 		return nil, fmt.Errorf("Error when trying to obtain the refs of repository %s (Repository does not exist).", repo)
 	}
-	format := "%(objectname)%09%(refname:short)%09%(committername)%09%(committeremail)%09%(committerdate)%09%(authorname)%09%(authoremail)%09%(authordate)%09%(contents:subject)"
+	format := "%(objectname)%09%(refname:short)%09%(committername)%09%(committeremail)%09%(committerdate)%09%(authorname)%09%(authoremail)%09%(authordate)%09%(taggername)%09%(taggeremail)%09%(taggerdate)%09%(contents:subject)"
 	cmd := exec.Command(gitPath, "for-each-ref", "--sort=-committerdate", "--format", format)
 	if len(pattern) > 0 {
 		cmd.Args = append(cmd.Args, pattern)
@@ -505,7 +506,7 @@ func (*GitContentRetriever) GetForEachRef(repo, pattern string) ([]Ref, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Error when trying to obtain the refs of repository %s (%s).", repo, err)
 	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	lines := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
 	objectCount := len(lines)
 	if len(lines) == 1 && len(lines[0]) == 0 {
 		objectCount = 0
@@ -517,7 +518,7 @@ func (*GitContentRetriever) GetForEachRef(repo, pattern string) ([]Ref, error) {
 			continue
 		}
 		fields := strings.Split(line, "\t")
-		if len(fields) > 7 { // let there be commits with empty subject
+		if len(fields) > 10 { // let there be commits with empty subject
 			ref = fields[0]
 			name = fields[1]
 			committerName = fields[2]
@@ -526,15 +527,23 @@ func (*GitContentRetriever) GetForEachRef(repo, pattern string) ([]Ref, error) {
 			authorName = fields[5]
 			authorEmail = fields[6]
 			authorDate = fields[7]
-			subject = strings.Join(fields[8:], "\t") // let there be subjects with \t
+			taggerName = fields[8]
+			taggerEmail = fields[9]
+			taggerDate = fields[10]
+			subject = strings.Join(fields[11:], "\t") // let there be subjects with \t
 		} else {
-			return nil, fmt.Errorf("Error when trying to obtain the refs of repository %s (Invalid git for-each-ref output [%s]).", repo, out)
+			log.Errorf("Could not match required ref elements for %s (invalid git input: %s).", repo, line)
+			continue
 		}
 		object := Ref{}
 		object.Ref = ref
 		object.Name = name
 		object.Subject = subject
-		object.CreatedAt = authorDate
+		if taggerDate != "" {
+			object.CreatedAt = taggerDate
+		} else {
+			object.CreatedAt = authorDate
+		}
 		object.Committer = &GitUser{
 			Name:  committerName,
 			Email: committerEmail,
@@ -545,6 +554,11 @@ func (*GitContentRetriever) GetForEachRef(repo, pattern string) ([]Ref, error) {
 			Email: authorEmail,
 			Date:  authorDate,
 		}
+		object.Tagger = &GitUser{
+			Name:  taggerName,
+			Email: taggerEmail,
+			Date:  taggerDate,
+		}
 		object.Links = &Links{
 			ZipArchive: GetArchiveUrl(repo, name, "zip"),
 			TarArchive: GetArchiveUrl(repo, name, "tar.gz"),
@@ -552,7 +566,7 @@ func (*GitContentRetriever) GetForEachRef(repo, pattern string) ([]Ref, error) {
 		objects[objectCount] = object
 		objectCount++
 	}
-	return objects, nil
+	return objects[0:objectCount], nil
 }
 
 func (*GitContentRetriever) GetBranches(repo string) ([]Ref, error) {
@@ -608,30 +622,6 @@ func (*GitContentRetriever) TempClone(repo string) (cloneDir string, cleanUp fun
 	return cloneDir, cleanUp, nil
 }
 
-func (*GitContentRetriever) SetCommitter(cloneDir string, committer GitUser) error {
-	gitPath, err := exec.LookPath("git")
-	if err != nil {
-		return fmt.Errorf("Error when trying to set committer of clone %s (%s).", cloneDir, err)
-	}
-	cloneExists, err := exists(cloneDir)
-	if err != nil || !cloneExists {
-		return fmt.Errorf("Error when trying to set committer of clone %s (Clone does not exist).", cloneDir)
-	}
-	cmd := exec.Command(gitPath, "config", "user.name", committer.Name)
-	cmd.Dir = cloneDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("Error when trying to set committer of clone %s (Invalid committer name [%s]).", cloneDir, out)
-	}
-	cmd = exec.Command(gitPath, "config", "user.email", committer.Email)
-	cmd.Dir = cloneDir
-	out, err = cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("Error when trying to set committer of clone %s (Invalid committer email [%s]).", cloneDir, out)
-	}
-	return nil
-}
-
 func (*GitContentRetriever) Checkout(cloneDir, branch string, isNew bool) error {
 	gitPath, err := exec.LookPath("git")
 	if err != nil {
@@ -672,7 +662,7 @@ func (*GitContentRetriever) AddAll(cloneDir string) error {
 	return nil
 }
 
-func (*GitContentRetriever) Commit(cloneDir, message string, author GitUser) error {
+func (*GitContentRetriever) Commit(cloneDir, message string, author, committer GitUser) error {
 	gitPath, err := exec.LookPath("git")
 	if err != nil {
 		return fmt.Errorf("Error when trying to commit to clone %s (%s).", cloneDir, err)
@@ -682,6 +672,10 @@ func (*GitContentRetriever) Commit(cloneDir, message string, author GitUser) err
 		return fmt.Errorf("Error when trying to commit to clone %s (Clone does not exist).", cloneDir)
 	}
 	cmd := exec.Command(gitPath, "commit", "-m", message, "--author", author.String(), "--allow-empty-message")
+	env := os.Environ()
+	env = append(env, fmt.Sprintf("GIT_COMMITTER_NAME=%s", committer.Name))
+	env = append(env, fmt.Sprintf("GIT_COMMITTER_EMAIL=%s", committer.Email))
+	cmd.Env = env
 	cmd.Dir = cloneDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -716,10 +710,6 @@ func (*GitContentRetriever) CommitZip(repo string, z *multipart.FileHeader, c Gi
 	if err != nil {
 		return nil, fmt.Errorf("Error when trying to commit zip to repository %s, could not clone: %s", repo, err)
 	}
-	err = SetCommitter(cloneDir, c.Committer)
-	if err != nil {
-		return nil, fmt.Errorf("Error when trying to commit zip to repository %s, could not set committer: %s", repo, err)
-	}
 	err = Checkout(cloneDir, c.Branch, false)
 	if err != nil {
 		err = Checkout(cloneDir, c.Branch, true)
@@ -735,7 +725,7 @@ func (*GitContentRetriever) CommitZip(repo string, z *multipart.FileHeader, c Gi
 	if err != nil {
 		return nil, fmt.Errorf("Error when trying to commit zip to repository %s, could not add all: %s", repo, err)
 	}
-	err = Commit(cloneDir, c.Message, c.Author)
+	err = Commit(cloneDir, c.Message, c.Author, c.Committer)
 	if err != nil {
 		return nil, fmt.Errorf("Error when trying to commit zip to repository %s, could not commit: %s", repo, err)
 	}
@@ -887,10 +877,6 @@ func TempClone(repo string) (string, func(), error) {
 	return retriever().TempClone(repo)
 }
 
-func SetCommitter(cloneDir string, committer GitUser) error {
-	return retriever().SetCommitter(cloneDir, committer)
-}
-
 func Checkout(cloneDir, branch string, isNew bool) error {
 	return retriever().Checkout(cloneDir, branch, isNew)
 }
@@ -899,8 +885,8 @@ func AddAll(cloneDir string) error {
 	return retriever().AddAll(cloneDir)
 }
 
-func Commit(cloneDir, message string, author GitUser) error {
-	return retriever().Commit(cloneDir, message, author)
+func Commit(cloneDir, message string, author, committer GitUser) error {
+	return retriever().Commit(cloneDir, message, author, committer)
 }
 
 func Push(cloneDir, branch string) error {

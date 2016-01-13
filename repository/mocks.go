@@ -103,6 +103,16 @@ func MakeCommit(testPath, content string) error {
 	return cmd.Run()
 }
 
+func PushTags(testPath string) error {
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(gitPath, "push", "--tags")
+	cmd.Dir = testPath
+	return cmd.Run()
+}
+
 func CreateCommit(tmpPath, repo, file, content string) error {
 	testPath := path.Join(tmpPath, repo+".git")
 	err := CreateFile(testPath, file, content)
@@ -212,13 +222,13 @@ func CreateTestRepository(tmpPath, repo, file, content string, folders ...string
 		return cleanup, err
 	}
 	for _, folder := range folders {
-		folderPath, err := CreateFolder(tmpPath, repo, folder)
-		if err != nil {
-			return cleanup, err
+		folderPath, createErr := CreateFolder(tmpPath, repo, folder)
+		if createErr != nil {
+			return cleanup, createErr
 		}
-		err = CreateFile(folderPath, file, content)
-		if err != nil {
-			return cleanup, err
+		createErr = CreateFile(folderPath, file, content)
+		if createErr != nil {
+			return cleanup, createErr
 		}
 	}
 	err = MakeCommit(testPath, content)
@@ -271,6 +281,20 @@ func CreateTag(testPath, tagname string) error {
 		return err
 	}
 	cmd := exec.Command(gitPath, "tag", tagname)
+	cmd.Dir = testPath
+	return cmd.Run()
+}
+
+func CreateAnnotatedTag(testPath, tagname, message string, tagger GitUser) error {
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(gitPath, "tag", "-a", tagname, "-m", message)
+	env := os.Environ()
+	env = append(env, fmt.Sprintf("GIT_COMMITTER_NAME=%s", tagger.Name))
+	env = append(env, fmt.Sprintf("GIT_COMMITTER_EMAIL=%s", tagger.Email))
+	cmd.Env = env
 	cmd.Dir = testPath
 	return cmd.Run()
 }
@@ -337,16 +361,6 @@ func (r *MockContentRetriever) TempClone(repo string) (string, func(), error) {
 	return r.ClonePath, r.CleanUp, nil
 }
 
-func (r *MockContentRetriever) SetCommitter(cloneDir string, committer GitUser) error {
-	if r.LookPathError != nil {
-		return r.LookPathError
-	}
-	if r.OutputError != nil {
-		return r.OutputError
-	}
-	return nil
-}
-
 func (r *MockContentRetriever) Checkout(cloneDir, branch string, isNew bool) error {
 	if r.LookPathError != nil {
 		return r.LookPathError
@@ -367,7 +381,7 @@ func (r *MockContentRetriever) AddAll(cloneDir string) error {
 	return nil
 }
 
-func (r *MockContentRetriever) Commit(cloneDir, message string, author GitUser) error {
+func (r *MockContentRetriever) Commit(cloneDir, message string, author, committer GitUser) error {
 	if r.LookPathError != nil {
 		return r.LookPathError
 	}

@@ -211,8 +211,10 @@ func (s *S) TestWriteTwoKeys(c *check.C) {
 		Comment:  "me@machine",
 		UserName: "glenda",
 	}
-	writeKey(&key1)
-	writeKey(&key2)
+	err := writeKey(&key1)
+	c.Assert(err, check.IsNil)
+	err = writeKey(&key2)
+	c.Assert(err, check.IsNil)
 	expected := key1.format() + key2.format()
 	f, err := s.rfs.Open(authKey())
 	c.Assert(err, check.IsNil)
@@ -270,6 +272,37 @@ func (s *S) TestAddKeyDuplicate(c *check.C) {
 
 func (s *S) TestAddKeyInvalidKey(c *check.C) {
 	err := addKey("key1", "something-invalid", "gopher")
+	c.Assert(err, check.Equals, ErrInvalidKey)
+}
+
+func (s *S) TestUpdateKey(c *check.C) {
+	err := addKey("key1", rawKey, "gopher")
+	c.Assert(err, check.IsNil)
+	conn, err := db.Conn()
+	c.Assert(err, check.IsNil)
+	defer conn.Close()
+	defer conn.Key().Remove(bson.M{"name": "key1"})
+	err = updateKey("key1", otherKey, "gopher")
+	c.Assert(err, check.IsNil)
+	var k Key
+	err = conn.Key().Find(bson.M{"name": "key1"}).One(&k)
+	c.Assert(err, check.IsNil)
+	c.Assert(k.Body, check.Equals, otherKey+"\n")
+	f, err := s.rfs.Open(authKey())
+	c.Assert(err, check.IsNil)
+	defer f.Close()
+	b, err := ioutil.ReadAll(f)
+	c.Assert(err, check.IsNil)
+	c.Assert(string(b), check.Equals, k.format())
+}
+
+func (s *S) TestUpdateKeyNotFound(c *check.C) {
+	err := updateKey("key1", otherKey, "gopher")
+	c.Assert(err, check.Equals, ErrKeyNotFound)
+}
+
+func (s *S) TestUpdateKeyInvalidKey(c *check.C) {
+	err := updateKey("key1", "something-invalid", "gopher")
 	c.Assert(err, check.Equals, ErrInvalidKey)
 }
 
@@ -365,7 +398,7 @@ func (s *S) TestRemoveUserKeys(c *check.C) {
 func (s *S) TestRemoveUserMultipleKeys(c *check.C) {
 	err := addKey("key1", rawKey, "glenda")
 	c.Assert(err, check.IsNil)
-	err = addKey("key1", otherKey, "glenda")
+	err = addKey("key2", otherKey, "glenda")
 	c.Assert(err, check.IsNil)
 	err = removeUserKeys("glenda")
 	c.Assert(err, check.IsNil)

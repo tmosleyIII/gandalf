@@ -8,11 +8,14 @@ package gandalftest
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"sync"
 
 	"github.com/gorilla/pat"
+	"github.com/tsuru/gandalf/repository"
+	"github.com/tsuru/gandalf/user"
 	"github.com/tsuru/tsuru/errors"
 	"golang.org/x/crypto/ssh"
 )
@@ -27,7 +30,7 @@ type Repository struct {
 	Diffs         chan string `json:"-"`
 }
 
-type user struct {
+type testUser struct {
 	Name string
 	Keys map[string]string
 }
@@ -201,6 +204,7 @@ func (s *GandalfServer) Reset() {
 
 func (s *GandalfServer) buildMuxer() {
 	s.muxer = pat.New()
+	s.muxer.Post("/user/{name}/key/{keyname}", http.HandlerFunc(s.updateKey))
 	s.muxer.Post("/user/{name}/key", http.HandlerFunc(s.addKeys))
 	s.muxer.Delete("/user/{name}/key/{keyname}", http.HandlerFunc(s.removeKey))
 	s.muxer.Get("/user/{name}/keys", http.HandlerFunc(s.listKeys))
@@ -219,14 +223,14 @@ func (s *GandalfServer) createUser(w http.ResponseWriter, r *http.Request) {
 	s.usersLock.Lock()
 	defer s.usersLock.Unlock()
 	defer r.Body.Close()
-	var usr user
+	var usr testUser
 	err := json.NewDecoder(r.Body).Decode(&usr)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if _, ok := s.keys[usr.Name]; ok {
-		http.Error(w, "user already exists", http.StatusConflict)
+		http.Error(w, user.ErrUserAlreadyExists.Error(), http.StatusConflict)
 		return
 	}
 	s.users = append(s.users, usr.Name)
@@ -241,7 +245,7 @@ func (s *GandalfServer) removeUser(w http.ResponseWriter, r *http.Request) {
 	userName := r.URL.Query().Get(":name")
 	_, index := s.findUser(userName)
 	if index < 0 {
-		http.Error(w, "user not found", http.StatusNotFound)
+		http.Error(w, user.ErrUserNotFound.Error(), http.StatusNotFound)
 		return
 	}
 	s.usersLock.Lock()
@@ -277,7 +281,7 @@ func (s *GandalfServer) createRepository(w http.ResponseWriter, r *http.Request)
 	defer s.repoLock.Unlock()
 	for _, r := range s.repos {
 		if r.Name == repo.Name {
-			http.Error(w, "repository already exists", http.StatusConflict)
+			http.Error(w, repository.ErrRepositoryAlreadyExists.Error(), http.StatusConflict)
 			return
 		}
 	}
@@ -290,7 +294,7 @@ func (s *GandalfServer) removeRepository(w http.ResponseWriter, r *http.Request)
 	name := r.URL.Query().Get(":name")
 	_, index := s.findRepository(name)
 	if index < 0 {
-		http.Error(w, "repository not found", http.StatusNotFound)
+		http.Error(w, repository.ErrRepositoryNotFound.Error(), http.StatusNotFound)
 		return
 	}
 	s.repoLock.Lock()
@@ -304,7 +308,7 @@ func (s *GandalfServer) getRepository(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get(":name")
 	repo, index := s.findRepository(name)
 	if index < 0 {
-		http.Error(w, "repository not found", http.StatusNotFound)
+		http.Error(w, repository.ErrRepositoryNotFound.Error(), http.StatusNotFound)
 		return
 	}
 	err := json.NewEncoder(w).Encode(repo)
@@ -317,7 +321,7 @@ func (s *GandalfServer) getDiff(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get(":name")
 	repo, index := s.findRepository(name)
 	if index < 0 {
-		http.Error(w, "repository not found", http.StatusNotFound)
+		http.Error(w, repository.ErrRepositoryNotFound.Error(), http.StatusNotFound)
 		return
 	}
 	var content string
@@ -365,14 +369,14 @@ func (s *GandalfServer) revokeAccess(w http.ResponseWriter, r *http.Request) {
 	for _, repository := range repositories {
 		repo, index := s.findRepository(repository)
 		for _, user := range users {
-			if index := s.checkUserAccess(repo, user, readOnly); index > -1 {
+			if userAccessIndex := s.checkUserAccess(repo, user, readOnly); userAccessIndex > -1 {
 				if readOnly {
 					last := len(repo.ReadOnlyUsers) - 1
-					repo.ReadOnlyUsers[index] = repo.ReadOnlyUsers[last]
+					repo.ReadOnlyUsers[userAccessIndex] = repo.ReadOnlyUsers[last]
 					repo.ReadOnlyUsers = repo.ReadOnlyUsers[:last]
 				} else {
 					last := len(repo.Users) - 1
-					repo.Users[index] = repo.Users[last]
+					repo.Users[userAccessIndex] = repo.Users[last]
 					repo.Users = repo.Users[:last]
 				}
 			}
@@ -432,17 +436,17 @@ func (s *GandalfServer) addKeys(w http.ResponseWriter, r *http.Request) {
 	defer s.usersLock.Unlock()
 	userKeys, ok := s.keys[userName]
 	if !ok {
-		http.Error(w, "user not found", http.StatusNotFound)
+		http.Error(w, user.ErrUserNotFound.Error(), http.StatusNotFound)
 		return
 	}
 	for name, body := range keys {
 		if _, _, _, _, err := ssh.ParseAuthorizedKey([]byte(body)); err != nil {
-			http.Error(w, fmt.Sprintf("key %q is not valid", name), http.StatusBadRequest)
+			http.Error(w, user.ErrInvalidKey.Error(), http.StatusBadRequest)
 			return
 		}
 		for _, userKey := range userKeys {
 			if name == userKey.Name {
-				http.Error(w, fmt.Sprintf("key %q already exists", name), http.StatusConflict)
+				http.Error(w, user.ErrDuplicateKey.Error(), http.StatusConflict)
 				return
 			}
 		}
@@ -453,6 +457,46 @@ func (s *GandalfServer) addKeys(w http.ResponseWriter, r *http.Request) {
 	s.keys[userName] = userKeys
 }
 
+func (s *GandalfServer) updateKey(w http.ResponseWriter, r *http.Request) {
+	userName := r.URL.Query().Get(":name")
+	keyName := r.URL.Query().Get(":keyname")
+	defer r.Body.Close()
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, _, _, _, err := ssh.ParseAuthorizedKey(body); err != nil {
+		http.Error(w, user.ErrInvalidKey.Error(), http.StatusBadRequest)
+		return
+	}
+	s.usersLock.Lock()
+	defer s.usersLock.Unlock()
+	userKeys, ok := s.keys[userName]
+	if !ok {
+		http.Error(w, user.ErrUserNotFound.Error(), http.StatusNotFound)
+		return
+	}
+	var (
+		k     key
+		index int
+	)
+	for i, userKey := range userKeys {
+		if userKey.Name == keyName {
+			k = userKey
+			index = i
+			break
+		}
+	}
+	if k.Name != keyName {
+		http.Error(w, user.ErrKeyNotFound.Error(), http.StatusNotFound)
+		return
+	}
+	k.Body = string(body)
+	userKeys[index] = k
+	s.keys[userName] = userKeys
+}
+
 func (s *GandalfServer) removeKey(w http.ResponseWriter, r *http.Request) {
 	userName := r.URL.Query().Get(":name")
 	keyName := r.URL.Query().Get(":keyname")
@@ -460,7 +504,7 @@ func (s *GandalfServer) removeKey(w http.ResponseWriter, r *http.Request) {
 	defer s.usersLock.Unlock()
 	userKeys, ok := s.keys[userName]
 	if !ok {
-		http.Error(w, "user not found", http.StatusNotFound)
+		http.Error(w, user.ErrUserNotFound.Error(), http.StatusNotFound)
 		return
 	}
 	index := -1
@@ -471,7 +515,7 @@ func (s *GandalfServer) removeKey(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if index < 0 {
-		http.Error(w, "key not found", http.StatusNotFound)
+		http.Error(w, user.ErrKeyNotFound.Error(), http.StatusNotFound)
 		return
 	}
 	last := len(userKeys) - 1
@@ -485,7 +529,7 @@ func (s *GandalfServer) listKeys(w http.ResponseWriter, r *http.Request) {
 	defer s.usersLock.RUnlock()
 	keys, ok := s.keys[userName]
 	if !ok {
-		http.Error(w, "user not found", http.StatusNotFound)
+		http.Error(w, user.ErrUserNotFound.Error(), http.StatusNotFound)
 		return
 	}
 	keysMap := make(map[string]string, len(keys))
